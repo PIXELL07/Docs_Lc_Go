@@ -2,20 +2,20 @@ package main
 
 import (
 	"bufio"
-	//"context"
+	"context"
 	"encoding/json"
-	//"flag"
+	"flag"
 	"fmt"
-	//"log"
+	"log"
 	"os"
 	"regexp"
-
-	//"sort"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/tmc/langchaingo/llms"
 	"github.com/tmc/langchaingo/llms/openai"
+	"github.com/tmc/langchaingo/prompts"
 )
 
 type LogEntry struct {
@@ -179,4 +179,292 @@ func inferLogLevel(line string) string {
 	default:
 		return "INFO"
 	}
+}
+
+func (la *LogAnalyzer) AnalyzeLogs(entries []LogEntry) (*LogAnalysis, error) {
+	if len(entries) == 0 {
+		return &LogAnalysis{}, nil
+	}
+
+	// Basic statistics
+	analysis := &LogAnalysis{
+		TotalEntries: len(entries),
+		TimeRange: TimeRange{
+			Start: entries[0].Timestamp,
+			End:   entries[len(entries)-1].Timestamp,
+		},
+	}
+
+	// Count by level
+	errorMessages := []string{}
+	for _, entry := range entries {
+		switch strings.ToUpper(entry.Level) {
+		case "ERROR", "FATAL":
+			analysis.ErrorCount++
+			errorMessages = append(errorMessages, entry.Message)
+		case "WARN", "WARNING":
+			analysis.WarningCount++
+		}
+	}
+
+	// Find error patterns
+	analysis.TopErrors = findErrorPatterns(errorMessages)
+
+	// Use AI for deeper analysis
+	if err := la.performAIAnalysis(entries, analysis); err != nil {
+		return nil, fmt.Errorf("AI analysis failed: %w", err)
+	}
+
+	return analysis, nil
+}
+
+func findErrorPatterns(messages []string) []ErrorPattern {
+	patternCounts := make(map[string]int)
+	patternExamples := make(map[string]string)
+
+	for _, msg := range messages {
+		// Normalize error messages by removing specific values
+		pattern := normalizeErrorMessage(msg)
+		patternCounts[pattern]++
+		if patternExamples[pattern] == "" {
+			patternExamples[pattern] = msg
+		}
+	}
+
+	// Sort by frequency
+	type kv struct {
+		Pattern string
+		Count   int
+	}
+
+	var sorted []kv
+	for k, v := range patternCounts {
+		sorted = append(sorted, kv{k, v})
+	}
+
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Count > sorted[j].Count
+	})
+
+	var result []ErrorPattern
+	for i, kv := range sorted {
+		if i >= 10 { // Top 10 patterns
+			break
+		}
+		result = append(result, ErrorPattern{
+			Pattern: kv.Pattern,
+			Count:   kv.Count,
+			Example: patternExamples[kv.Pattern],
+		})
+	}
+
+	return result
+}
+
+func normalizeErrorMessage(msg string) string {
+	// Replace common variable patterns
+	re1 := regexp.MustCompile(`\d+`)
+	re2 := regexp.MustCompile(`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`)
+	re3 := regexp.MustCompile(`\b\w+@\w+\.\w+\b`)
+
+	normalized := re1.ReplaceAllString(msg, "XXX")
+	normalized = re2.ReplaceAllString(normalized, "UUID")
+	normalized = re3.ReplaceAllString(normalized, "EMAIL")
+
+	return normalized
+}
+
+func (la *LogAnalyzer) performAIAnalysis(entries []LogEntry, analysis *LogAnalysis) error {
+	// Prepare sample of entries for AI analysis
+	sampleSize := 50
+	if len(entries) < sampleSize {
+		sampleSize = len(entries)
+	}
+
+	sample := entries[len(entries)-sampleSize:] // Last N entries
+
+	template := prompts.NewPromptTemplate(`
+You are an expert system administrator analyzing application logs. Based on the log data provided, identify:
+
+1. **Anomalies**: Unusual patterns, spikes, or unexpected behaviors
+2. **Recommendations**: Specific actions to improve system reliability
+3. **Critical Issues**: Problems requiring immediate attention
+
+Log Summary:
+- Total Entries: {{.total_entries}}
+- Errors: {{.error_count}}
+- Warnings: {{.warning_count}}
+- Time Range: {{.time_range}}
+
+Top Error Patterns:
+{{range .top_errors}}
+- {{.pattern}} ({{.count}} occurrences)
+{{end}}
+
+Recent Log Sample:
+{{range .sample}}
+{{.timestamp}} [{{.level}}] {{.message}}
+{{end}}
+
+Respond in JSON format:
+{
+  "anomalies": [
+    {
+      "type": "error_spike|performance|security|other",
+      "description": "What was detected",
+      "severity": "critical|high|medium|low",
+      "examples": ["example log entries"]
+    }
+  ],
+  "recommendations": [
+    "Specific actionable recommendations"
+  ]
+}`, []string{"total_entries", "error_count", "warning_count", "time_range", "top_errors", "sample"})
+
+	sampleData := make([]map[string]string, len(sample))
+	for i, entry := range sample {
+		sampleData[i] = map[string]string{
+			"timestamp": entry.Timestamp.Format(time.RFC3339),
+			"level":     entry.Level,
+			"message":   entry.Message,
+		}
+	}
+
+	prompt, err := template.Format(map[string]any{
+		"total_entries": analysis.TotalEntries,
+		"error_count":   analysis.ErrorCount,
+		"warning_count": analysis.WarningCount,
+		"time_range":    fmt.Sprintf("%s to %s", analysis.TimeRange.Start.Format(time.RFC3339), analysis.TimeRange.End.Format(time.RFC3339)),
+		"top_errors":    analysis.TopErrors,
+		"sample":        sampleData,
+	})
+	if err != nil {
+		return fmt.Errorf("formatting prompt: %w", err)
+	}
+
+	ctx := context.Background()
+	response, err := la.llm.GenerateContent(ctx, []llms.MessageContent{
+		llms.TextParts(llms.ChatMessageTypeHuman, prompt),
+	}, llms.WithJSONMode())
+	if err != nil {
+		return fmt.Errorf("generating analysis: %w", err)
+	}
+
+	var aiResult struct {
+		Anomalies       []Anomaly `json:"anomalies"`
+		Recommendations []string  `json:"recommendations"`
+	}
+
+	if err := json.Unmarshal([]byte(response.Choices[0].Content), &aiResult); err != nil {
+		return fmt.Errorf("parsing AI response: %w", err)
+	}
+
+	analysis.Anomalies = aiResult.Anomalies
+	analysis.Recommendations = aiResult.Recommendations
+
+	return nil
+}
+
+func (la *LogAnalysis) PrintReport() {
+	fmt.Printf("📊 Log Analysis Report\n")
+	fmt.Printf("=====================\n\n")
+
+	fmt.Printf("📈 Summary:\n")
+	fmt.Printf("  Total Entries: %d\n", la.TotalEntries)
+	fmt.Printf("  Errors: %d\n", la.ErrorCount)
+	fmt.Printf("  Warnings: %d\n", la.WarningCount)
+	fmt.Printf("  Time Range: %s to %s\n\n",
+		la.TimeRange.Start.Format("2006-01-02 15:04:05"),
+		la.TimeRange.End.Format("2006-01-02 15:04:05"))
+
+	if len(la.TopErrors) > 0 {
+		fmt.Printf("🔴 Top Error Patterns:\n")
+		for i, pattern := range la.TopErrors {
+			if i >= 5 {
+				break
+			}
+			fmt.Printf("  %d. %s (%d occurrences)\n", i+1, pattern.Pattern, pattern.Count)
+		}
+		fmt.Println()
+	}
+
+	if len(la.Anomalies) > 0 {
+		fmt.Printf("⚠️  Detected Anomalies:\n")
+		for _, anomaly := range la.Anomalies {
+			fmt.Printf("  %s - %s (%s)\n", anomaly.Type, anomaly.Description, anomaly.Severity)
+		}
+		fmt.Println()
+	}
+
+	if len(la.Recommendations) > 0 {
+		fmt.Printf("💡 Recommendations:\n")
+		for i, rec := range la.Recommendations {
+			fmt.Printf("  %d. %s\n", i+1, rec)
+		}
+		fmt.Println()
+	}
+}
+
+func main() {
+	var (
+		file   = flag.String("file", "", "Log file to analyze")
+		output = flag.String("output", "", "Output file for JSON report")
+		watch  = flag.Bool("watch", false, "Watch file for changes")
+	)
+	flag.Parse()
+
+	if *file == "" {
+		fmt.Println("Usage: log-analyzer -file=application.log")
+		os.Exit(1)
+	}
+
+	analyzer, err := NewLogAnalyzer()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if *watch {
+		// Watch mode - simplified version
+		fmt.Printf("👀 Watching %s for changes...\n", *file)
+		for {
+			if err := analyzeFile(analyzer, *file, *output); err != nil {
+				log.Printf("Analysis error: %v", err)
+			}
+			time.Sleep(30 * time.Second)
+		}
+	} else {
+		if err := analyzeFile(analyzer, *file, *output); err != nil {
+			log.Fatal(err)
+		}
+	}
+}
+
+func analyzeFile(analyzer *LogAnalyzer, filename, outputFile string) error {
+	fmt.Printf("🔍 Analyzing %s...\n", filename)
+
+	entries, err := analyzer.ParseLogFile(filename)
+	if err != nil {
+		return fmt.Errorf("parsing log file: %w", err)
+	}
+
+	analysis, err := analyzer.AnalyzeLogs(entries)
+	if err != nil {
+		return fmt.Errorf("analyzing logs: %w", err)
+	}
+
+	analysis.PrintReport()
+
+	if outputFile != "" {
+		data, err := json.MarshalIndent(analysis, "", "  ")
+		if err != nil {
+			return fmt.Errorf("marshaling report: %w", err)
+		}
+
+		if err := os.WriteFile(outputFile, data, 0644); err != nil {
+			return fmt.Errorf("writing report: %w", err)
+		}
+		fmt.Printf("📄 Report saved to %s\n", outputFile)
+	}
+
+	return nil
 }
