@@ -1,0 +1,10 @@
+2026-02-15 10:30:01 [INFO] Application started successfully
+2026-02-15 10:30:02 [INFO] Database connection established
+2026-02-15 10:30:15 [ERROR] Failed to process user request: invalid email format user@
+2026-02-15 10:30:16 [WARN] High memory usage detected: 85%
+2026-02-15 10:30:17 [ERROR] Database timeout after 30s
+2026-02-15 10:30:18 [ERROR] Failed to process user request: invalid email format admin@
+2026-02-15 10:30:19 [INFO] Request processed successfully
+2026-02-15 10:30:25 [ERROR] Database timeout after 30s
+2026-02-15 10:30:30 [FATAL] Out of memory error - application terminating
+2026-02-15 10:30:31 [INFO] Application shutdown initiated
